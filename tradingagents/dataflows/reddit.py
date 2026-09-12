@@ -48,6 +48,45 @@ _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 # investing trend more measured. Caller can override.
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 
+# Crypto discussion barely happens in the equity subreddits — searching
+# r/wallstreetbets for "BTC" returns a trickle of passing mentions rather than
+# the conversation that actually moves the asset. Since sentiment carries more
+# weight in crypto than in equities, pointing the sentiment analyst at the
+# wrong communities weakened exactly the leg it most depends on.
+# Asset-neutral rooms only: a BTC query has no business searching r/ethtrader.
+# Per-asset communities are added ahead of these by ``subreddits_for``.
+CRYPTO_SUBREDDITS = ("CryptoCurrency", "CryptoMarkets")
+
+# Per-asset communities, added to the general crypto set when the base matches.
+_CRYPTO_SUBREDDIT_BY_BASE = {
+    "BTC": ("Bitcoin",),
+    "ETH": ("ethereum", "ethtrader"),
+    "SOL": ("solana",),
+    "XRP": ("XRP",),
+    "ADA": ("cardano",),
+    "DOGE": ("dogecoin",),
+    "LTC": ("litecoin",),
+    "AVAX": ("Avax",),
+    "LINK": ("Chainlink",),
+    "DOT": ("Polkadot",),
+}
+
+
+def subreddits_for(ticker: str) -> tuple[str, ...]:
+    """Pick the communities where ``ticker`` is actually discussed.
+
+    Equities keep the finance subreddits; crypto pairs get the crypto ones,
+    with the asset's own community first when there is one.
+    """
+    base = crypto_base(ticker)
+    if base is None:
+        return DEFAULT_SUBREDDITS
+    specific = _CRYPTO_SUBREDDIT_BY_BASE.get(base, ())
+    # Dedupe while preserving order: the asset's own sub leads, then the
+    # general crypto rooms.
+    ordered = list(specific) + [s for s in CRYPTO_SUBREDDITS if s not in specific]
+    return tuple(ordered[:4])
+
 
 def _search_qs(ticker: str, limit: int) -> str:
     return urlencode({
@@ -190,7 +229,7 @@ def _fetch_subreddit(
 
 def fetch_reddit_posts(
     ticker: str,
-    subreddits: Iterable[str] = DEFAULT_SUBREDDITS,
+    subreddits: Iterable[str] | None = None,
     limit_per_sub: int = 5,
     timeout: float = 10.0,
     inter_request_delay: float = 1.0,
@@ -202,6 +241,10 @@ def fetch_reddit_posts(
     stay under Reddit's public per-IP rate limit; combined with the RSS-first
     path it makes 429s rare even when several analyses run back-to-back.
     """
+    # Choose communities before the ticker is rewritten: the routing decision
+    # needs the original pair form (BTC-USD), the search query needs the base.
+    if subreddits is None:
+        subreddits = subreddits_for(ticker)
     # Crypto reaches us as a Yahoo pair (BTC-USD); search Reddit for the base
     # ("BTC") so the query actually matches discussion instead of near-nothing.
     ticker = crypto_base(ticker) or ticker

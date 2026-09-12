@@ -1,0 +1,35 @@
+# Run the 24/7 paper-trading desk:
+#
+#   cp .env.example .env          # add an LLM provider key (optional)
+#   docker compose -f docker-compose.desk.yml up -d
+#   open http://127.0.0.1:8787
+#
+# The named volume keeps the ledger — the equity curve, every fill and every
+# decision — across container restarts and rebuilds. Delete it and the track
+# record is gone, so back it up before pruning volumes.
+services:
+  cryptodesk:
+    build:
+      context: .
+      dockerfile: Dockerfile.desk
+    env_file:
+      - .env
+    environment:
+      CRYPTODESK_SYMBOLS: "BTC-USD,ETH-USD"
+      CRYPTODESK_STARTING_EQUITY: "10000"
+      # "auto" uses the TradingAgents committee when a provider key is present
+      # and the free heuristic baseline otherwise.
+      CRYPTODESK_COMMITTEE: "auto"
+      # Cap what the committee may spend per UTC day. Raise it only after you
+      # have measured your real per-run cost.
+      CRYPTODESK_LLM_DAILY_CAP: "5.00"
+    ports:
+      # Bound to localhost on purpose: the dashboard has no authentication,
+      # and anyone who can reach it can halt the desk.
+      - "127.0.0.1:8787:8787"
+    volumes:
+      - cryptodesk_data:/home/appuser/.cryptodesk
+    restart: unless-stopped
+
+volumes:
+  cryptodesk_data:

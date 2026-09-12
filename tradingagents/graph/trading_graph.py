@@ -238,9 +238,15 @@ class TradingAgentsGraph:
         entry, which is the right default because the alpha calculation works
         in USD.
         """
+        from tradingagents.dataflows.symbol_utils import crypto_base
+
         explicit = self.config.get("benchmark_ticker")
         if explicit:
             return explicit
+        # Crypto first: the suffix map below is equity-venue only, so a pair
+        # like BTC-USD would otherwise fall through to SPY (#alpha-vs-sp500).
+        if crypto_base(ticker) is not None:
+            return self.config.get("crypto_benchmark") or "BTC-USD"
         benchmark_map = self.config.get("benchmark_map", {})
         ticker_upper = ticker.upper()
         for suffix, benchmark in benchmark_map.items():
@@ -275,17 +281,29 @@ class TradingAgentsGraph:
             if len(stock) < 2 or len(bench) < 2:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
+            # Both legs of the alpha subtraction must span the same calendar
+            # window. Aligning by ROW instead silently compared different
+            # periods whenever the two series trade on different calendars —
+            # crypto runs 7 days a week and equity benchmarks 5, so row N of a
+            # BTC series and row N of SPY are days apart, and every crypto
+            # alpha figure was wrong by a weekend.
+            target = stock.index[min(holding_days, len(stock) - 1)]
+            # If the benchmark's history ends earlier, both sides truncate to
+            # the last date they share rather than one running past the other.
+            common_end = min(target, bench.index[-1])
+            stock_pos = max(1, int(stock.index.searchsorted(common_end, side="right")) - 1)
+            bench_pos = max(1, int(bench.index.searchsorted(common_end, side="right")) - 1)
+
             raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
+                (stock["Close"].iloc[stock_pos] - stock["Close"].iloc[0])
                 / stock["Close"].iloc[0]
             )
             bench_ret = float(
-                (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
+                (bench["Close"].iloc[bench_pos] - bench["Close"].iloc[0])
                 / bench["Close"].iloc[0]
             )
             alpha = raw - bench_ret
-            return raw, alpha, actual_days
+            return raw, alpha, stock_pos
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",

@@ -29,6 +29,9 @@ class Fill:
     fee: float
     realized_pnl: float = 0.0
     reason: str = ""
+    # The position lifecycle this fill belongs to, so partial exits of one
+    # trade can be scored as one trade rather than several.
+    trade_id: str = ""
 
     @property
     def notional(self) -> float:
@@ -40,7 +43,7 @@ class Fill:
             "qty": self.qty, "price": self.price,
             "reference_price": self.reference_price, "fee": self.fee,
             "realized_pnl": self.realized_pnl, "reason": self.reason,
-            "notional": self.notional,
+            "notional": self.notional, "trade_id": self.trade_id,
         }
 
 
@@ -59,6 +62,13 @@ class Position:
     fees_paid: float = 0.0
     entry_reason: str = ""
     tags: dict = field(default_factory=dict)
+    # Unique per lifecycle (open -> flat); every fill of the trade carries it.
+    trade_id: str = ""
+    # Fees paid on opening/adding fills that have not yet been charged against
+    # realised P&L. ``avg_price`` stays gross so the dashboard shows the true
+    # entry; the entry cost is instead released pro-rata as the position is
+    # reduced, so realised P&L reconciles with the change in equity.
+    entry_fees: float = 0.0
 
     @property
     def is_long(self) -> bool:
@@ -81,7 +91,8 @@ class Position:
             "opened_ts": self.opened_ts, "stop_price": self.stop_price,
             "extreme_price": self.extreme_price, "realized_pnl": self.realized_pnl,
             "fees_paid": self.fees_paid, "entry_reason": self.entry_reason,
-            "tags": dict(self.tags),
+            "tags": dict(self.tags), "trade_id": self.trade_id,
+            "entry_fees": self.entry_fees,
         }
         if price is not None:
             data.update({

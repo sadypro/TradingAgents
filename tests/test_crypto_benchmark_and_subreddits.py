@@ -180,3 +180,37 @@ def test_both_legs_truncate_to_the_last_shared_date(monkeypatch):
     assert days == 2, "the asset window should truncate to the benchmark's last date"
     assert raw == pytest.approx(1.02 ** 2 - 1)
     assert alpha == pytest.approx(0.0), "identical series over the same window have no alpha"
+
+
+def test_offset_calendars_and_timezones_share_one_window(monkeypatch):
+    """BTC at 00:00 UTC from a Saturday vs SPY at 00:00 New York from Monday.
+
+    yfinance stamps each venue in its own zone, so SPY's Monday bar sorts
+    *after* BTC's Monday bar and the raw timestamps never line up. Before the
+    fix the asset leg started on Saturday (two days before the benchmark had
+    any data) and, because SPY's 05:00 UTC stamp overshoots the 00:00 UTC
+    window end, the benchmark leg ended a day early.
+    """
+    btc_index = pd.date_range("2026-01-03", periods=14, freq="D", tz="UTC")     # Sat 03 Jan
+    spy_index = pd.bdate_range("2026-01-05", periods=10, tz="America/New_York")  # Mon 05 Jan
+    btc = pd.DataFrame({"Close": [100.0 * (1.01 ** i) for i in range(len(btc_index))]},
+                       index=btc_index)
+    spy = pd.DataFrame({"Close": [100.0 * (1.02 ** i) for i in range(len(spy_index))]},
+                       index=spy_index)
+
+    class _Ticker:
+        def __init__(self, symbol):
+            self.symbol = symbol
+
+        def history(self, start, end):
+            return btc if self.symbol == "BTC-USD" else spy
+
+    monkeypatch.setattr("tradingagents.graph.trading_graph.yf.Ticker", _Ticker)
+    raw, alpha, days = TradingAgentsGraph._fetch_returns(
+        _Graph(), "BTC-USD", "2026-01-03", holding_days=5, benchmark="SPY")
+
+    # Window: Mon 05 Jan (first shared date) to Sat 10 Jan (five BTC bars on).
+    assert days == 5
+    assert raw == pytest.approx(1.01 ** 5 - 1), "five BTC bars: Mon 05 -> Sat 10"
+    # SPY's last bar on or before Sat 10 is Fri 09: four bars from Mon 05.
+    assert alpha == pytest.approx(raw - (1.02 ** 4 - 1))

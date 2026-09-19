@@ -20,12 +20,20 @@ import time
 from pathlib import Path
 
 from .api.server import build_app, performance
-from .config import DeskConfig
-from .engine.committee import HeuristicCommittee, _llm_unavailable_reason, build_committee
+from .config import DeskConfig, config_source
+from .engine.committee import (
+    HeuristicCommittee,
+    _llm_unavailable_reason,
+    build_committee,
+    desk_ta_config,
+)
 from .engine.ledger import Ledger
 from .engine.loop import Desk
 from .feeds import build_feed
-from .feeds.base import FeedError
+from .feeds.base import FeedError, interval_seconds
+
+# Statistics are computed over the whole run, thinned to this many marks.
+_LIFETIME_POINTS = 4000
 
 
 def _setup_logging(verbose: bool) -> None:
@@ -64,6 +72,11 @@ def cmd_run(args) -> int:
         cfg.feeds = [args.feed]
     if args.committee:
         cfg.committee = args.committee
+    if args.host:
+        cfg.api_host = args.host
+    if args.port:
+        cfg.api_port = args.port
+    cfg.validate()
 
     desk = Desk(cfg)
     print(f"CryptoDesk: {', '.join(cfg.symbols)}")
@@ -72,8 +85,10 @@ def cmd_run(args) -> int:
     print(f"  equity    ${cfg.starting_equity:,.2f} (paper)")
     print(f"  ledger    {cfg.db_path}")
     print(f"  dashboard http://{cfg.api_host}:{cfg.api_port}")
-    if desk.committee.name == "heuristic" and cfg.committee != "heuristic":
-        print(f"  note: LLM committee unavailable — {_llm_unavailable_reason()}")
+    # In auto mode the committee is a wrapper named "llm" until it falls back,
+    # so the type, not the name, says whether the LLM path was ever available.
+    if isinstance(desk.committee, HeuristicCommittee) and cfg.committee != "heuristic":
+        print(f"  note: LLM committee unavailable — {_llm_unavailable_reason(desk_ta_config(cfg))}")
 
     desk.start_background()
     app = build_app(desk)
@@ -82,7 +97,9 @@ def cmd_run(args) -> int:
     except KeyboardInterrupt:  # pragma: no cover - interactive
         pass
     finally:
-        desk.stop()
+        # Bounded by one loop period: that is the longest the thread waits
+        # between ticks, and the final persist happens when it exits.
+        desk.stop(timeout=cfg.fast_loop_seconds)
         print("\nDesk stopped.")
     return 0
 
@@ -105,19 +122,27 @@ def cmd_simulate(args) -> int:
     cfg.committee = args.committee or "heuristic"
     # Simulated runs get their own ledger so they never pollute a live record.
     cfg.home = args.home or str(Path(cfg.home_path) / "simulations" / time.strftime("%Y%m%d-%H%M%S"))
+    cfg.validate()
     cfg.ensure_dirs()
 
     step = args.step_minutes * 60
     ticks = int((args.days * 24 * 60) / args.step_minutes)
-    clock = _Clock(time.time() - ticks * step)
+    interval_s = interval_seconds(cfg.candle_interval)
 
     if args.replay:
         from .feeds import ReplayFeed
         feed = ReplayFeed(directory=args.replay, cursor=args.warmup)
+        # The episode sets the calendar: the clock sits at the close of the
+        # last visible bar, so ledger timestamps are the episode's own dates,
+        # and the run ends with the data instead of ticking on a frozen tape.
+        ticks = min(ticks, max(min(feed.total_bars(s) for s in cfg.symbols) - args.warmup, 0))
+        clock = _Clock(_replay_now(feed, cfg, interval_s))
+        _warn_if_bar_size_disagrees(feed, cfg, interval_s)
     else:
         from .feeds import SyntheticFeed
+        clock = _Clock(time.time() - ticks * step)
         feed = SyntheticFeed(seed=args.seed, drift_per_year=args.drift,
-                             annual_vol=args.vol, clock=clock)
+                             annual_vol=args.vol, clock=clock, interval=cfg.candle_interval)
 
     committee = HeuristicCommittee() if cfg.committee == "heuristic" else build_committee(cfg)
     desk = Desk(cfg, feed=feed, committee=committee, clock=clock)
@@ -131,10 +156,16 @@ def cmd_simulate(args) -> int:
 
     started = time.time()
     for i in range(ticks):
+        if args.replay:
+            if any(feed.exhausted(s) for s in cfg.symbols):
+                print(f"  replay data exhausted after {i} ticks")
+                break
+            clock.t = _replay_now(feed, cfg, interval_s)
         desk.tick()
-        clock.advance(step)
         if args.replay:
             feed.advance(1)
+        else:
+            clock.advance(step)
         if args.progress and i % max(1, ticks // 20) == 0:
             state = desk.state()
             print(f"    {i:6d}/{ticks}  equity ${state['account']['equity']:,.2f}  "
@@ -153,12 +184,35 @@ def cmd_simulate(args) -> int:
     return 0
 
 
+def _replay_now(feed, cfg: DeskConfig, interval_s: int) -> int:
+    """The desk clock for the next replay tick: the close of the newest visible bar."""
+    return max(feed.candles(s, cfg.candle_interval, 1)[-1].ts for s in cfg.symbols) + interval_s
+
+
+def _warn_if_bar_size_disagrees(feed, cfg: DeskConfig, interval_s: int) -> None:
+    # The engine treats a bar older than two intervals as stale, so a CSV of
+    # hourly bars replayed under a 5m config would never trade — say so.
+    for symbol in cfg.symbols:
+        bars = feed.candles(symbol, cfg.candle_interval, 2)
+        if len(bars) == 2 and bars[1].ts - bars[0].ts != interval_s:
+            print(f"  WARNING: {symbol}.csv bars are {bars[1].ts - bars[0].ts}s apart but "
+                  f"candle_interval is {cfg.candle_interval}; set CRYPTODESK_CANDLE_INTERVAL "
+                  "to match or every bar will look stale")
+
+
 def cmd_doctor(args) -> int:
     """Check everything a live run needs, and say what is wrong if anything is."""
-    cfg = DeskConfig.load(args.config)
     problems = 0
-
     print("Config")
+    source, origin = config_source(args.config)
+    print(f"  file           {source} (from {origin})" if source else "  file           none (defaults + CRYPTODESK_* env)")
+    try:
+        cfg = DeskConfig.load(args.config)
+    except (FileNotFoundError, ValueError) as exc:
+        # Nothing else can be checked against a config that will not load.
+        print(f"  [FAIL] {exc}")
+        print("\n1 problem(s) above.")
+        return 1
     print(f"  symbols        {', '.join(cfg.symbols)}")
     print(f"  starting cash  ${cfg.starting_equity:,.2f} (paper)")
     print(f"  home           {cfg.home_path}")
@@ -168,15 +222,17 @@ def cmd_doctor(args) -> int:
           f"daily stop {cfg.risk.daily_loss_limit:.0%}")
     print(f"  llm budget     ${cfg.llm.daily_usd_cap:.2f}/day, "
           f"min {cfg.llm.min_minutes_between_calls}m between runs per symbol")
+    if cfg.benchmark_symbol not in cfg.symbols:
+        print(f"  benchmark      {cfg.benchmark_symbol} is not in symbols; "
+              "fetched for comparison only")
 
     print("\nFeeds")
     for name in cfg.feeds:
         try:
-            feed = build_feed(name)
-            candles = feed.candles(cfg.symbols[0], cfg.candle_interval, 20)
-            price = feed.price(cfg.symbols[0])
+            feed = build_feed(name, interval=cfg.candle_interval)
+            candles, price, venue = feed.market(cfg.symbols[0], cfg.candle_interval, 20)
             print(f"  [ok]   {name:12} {len(candles)} candles, last price "
-                  f"${price:,.2f} for {cfg.symbols[0]}")
+                  f"${price:,.2f} for {cfg.symbols[0]} via {venue}")
         except (FeedError, Exception) as exc:  # noqa: BLE001 - report, never raise
             problems += 1
             print(f"  [FAIL] {name:12} {exc}")
@@ -184,7 +240,9 @@ def cmd_doctor(args) -> int:
     print("   the chain falls back to the next one, and 'synthetic' always works)")
 
     print("\nCommittee")
-    reason = _llm_unavailable_reason()
+    # The provider-specific key, not just any key: the desk's own paths land
+    # under <home>/tradingagents and the provider comes from that config.
+    reason = _llm_unavailable_reason(desk_ta_config(cfg))
     if reason:
         print(f"  [warn] LLM committee unavailable: {reason}")
         print("         The desk will run the free heuristic baseline instead.")
@@ -214,7 +272,10 @@ def cmd_report(args) -> int:
         print(f"No ledger at {path}. Run the desk first.", file=sys.stderr)
         return 1
     ledger = Ledger(path)
-    _print_report(ledger, cfg.starting_equity, cfg)
+    # The ledger's own starting capital, as the running desk uses it: a config
+    # edited after the run began must not re-base the whole track record.
+    stored = (ledger.get_state("broker_state") or {}).get("starting_equity")
+    _print_report(ledger, float(stored) if stored else cfg.starting_equity, cfg)
     ledger.close()
     return 0
 
@@ -233,10 +294,12 @@ def cmd_init(args) -> int:
 
 
 def _print_report(ledger: Ledger, starting_equity: float, cfg: DeskConfig) -> None:
-    curve = ledger.equity_curve(limit=1_000_000)
+    curve = ledger.equity_curve_sampled(max_points=_LIFETIME_POINTS)
     stats = ledger.trade_stats()
+    risk_state = ledger.get_state("risk_state") or {}
     perf = performance(curve, starting_equity, llm_spend=ledger.spend_total(),
-                       bar_minutes=max(cfg.fast_loop_seconds / 60.0, 1 / 60.0))
+                       max_drawdown=risk_state.get("max_drawdown"),
+                       first_benchmark_price=risk_state.get("first_benchmark_price"))
     if not curve:
         print("No equity history recorded yet.")
         return
@@ -257,7 +320,7 @@ def _print_report(ledger: Ledger, starting_equity: float, cfg: DeskConfig) -> No
     print(f"  max drawdown      {perf['max_drawdown'] * 100:.2f}%")
     if perf["sharpe"] is not None:
         print(f"  annualised vol    {perf['annualised_vol'] * 100:.1f}%"
-              f"   ·  Sharpe {perf['sharpe']:.2f} (rf=0)")
+              f"   ·  Sharpe {perf['sharpe']:.2f} (rf=0, {perf['bar_minutes']:g}m bars)")
     print("\nCosts")
     print(f"  LLM spend         ${perf['llm_spend']:,.2f}")
     print(f"  net of LLM        ${perf['net_equity_after_llm']:,.2f}   ({pct(perf['net_return_after_llm'])})")
@@ -284,6 +347,8 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--symbols", help="comma-separated, e.g. BTC-USD,ETH-USD")
     run.add_argument("--feed", help="cryptocom | binance | synthetic | replay")
     run.add_argument("--committee", choices=["auto", "llm", "heuristic"])
+    run.add_argument("--host", help="dashboard bind address (overrides api_host)")
+    run.add_argument("--port", type=int, help="dashboard port (overrides api_port)")
     run.set_defaults(func=cmd_run)
 
     sim = sub.add_parser("simulate", help="fast-forward paper trading over compressed time")

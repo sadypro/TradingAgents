@@ -46,6 +46,9 @@ class PaperBroker:
         self.fills: list[Fill] = []
         self.total_fees = 0.0
         self.total_realized_pnl = 0.0
+        # Counts lifecycles opened, so two positions opened in the same second
+        # still get distinct trade ids. Persisted with the rest of the state.
+        self._trade_seq = 0
 
     # ---- introspection ------------------------------------------------
     def cash(self) -> float:
@@ -120,7 +123,9 @@ class PaperBroker:
                 )
             fill = self._increase(symbol, side, qty, exec_price, price, fee, ts, reason)
 
-        self.total_fees += fee
+        # Accumulate from the fill, not the requested qty: a reduce recomputes
+        # the fee on what actually closed.
+        self.total_fees += fill.fee
         self.fills.append(fill)
         return fill
 
@@ -144,10 +149,13 @@ class PaperBroker:
 
         pos = self._positions.get(symbol)
         if pos is None:
-            self._positions[symbol] = Position(
+            self._trade_seq += 1
+            pos = Position(
                 symbol=symbol, qty=signed_qty, avg_price=exec_price, opened_ts=ts,
                 extreme_price=exec_price, fees_paid=fee, entry_reason=reason,
+                trade_id=f"{symbol}-{ts}-{self._trade_seq}", entry_fees=fee,
             )
+            self._positions[symbol] = pos
         else:
             total_qty = pos.qty + signed_qty
             # Weighted-average entry over the combined absolute size.
@@ -156,27 +164,37 @@ class PaperBroker:
             ) / abs(total_qty)
             pos.qty = total_qty
             pos.fees_paid += fee
+            pos.entry_fees += fee
         return Fill(ts=ts, symbol=symbol, side=side, qty=qty, price=exec_price,
-                    reference_price=ref_price, fee=fee, realized_pnl=0.0, reason=reason)
+                    reference_price=ref_price, fee=fee, realized_pnl=0.0, reason=reason,
+                    trade_id=pos.trade_id)
 
     def _reduce(self, pos: Position, symbol: str, side: Side, qty: float,
                 exec_price: float, ref_price: float, fee: float, ts: int,
                 reason: str) -> Fill:
         """Reduce or close a position, booking realised P&L."""
         closing = min(qty, abs(pos.qty))
-        if closing < qty - _DUST and not self.allow_shorts:
-            # Selling more than held would flip long -> short.
+        if closing < qty - _DUST:
+            # An order larger than the position would reverse direction. Even
+            # with shorts enabled that is refused rather than silently filled
+            # as a plain close: the caller asked for a position it would not
+            # get, and the book must never disagree with what was reported.
             raise OrderRejected(
-                f"Cannot sell {qty} {symbol}: only {abs(pos.qty)} held and shorts are disabled"
+                f"Cannot {side} {qty} {symbol}: only {abs(pos.qty)} held; "
+                "reversing direction in one order is not supported"
             )
         notional = closing * exec_price
         # Fee was computed on the requested qty; recompute on what actually filled.
         fee = notional * self.fee_rate
         direction = 1 if pos.is_long else -1
-        realized = (exec_price - pos.avg_price) * closing * direction - fee
+        # Release the share of entry fees this exit closes out, so a round trip
+        # at a flat price realises exactly its costs (see Position.entry_fees).
+        entry_share = pos.entry_fees * closing / abs(pos.qty)
+        realized = (exec_price - pos.avg_price) * closing * direction - fee - entry_share
 
         self._cash += notional - fee if pos.is_long else -(notional + fee)
         pos.qty -= closing * direction
+        pos.entry_fees -= entry_share
         pos.realized_pnl += realized
         pos.fees_paid += fee
         self.total_realized_pnl += realized
@@ -186,7 +204,7 @@ class PaperBroker:
 
         return Fill(ts=ts, symbol=symbol, side=side, qty=closing, price=exec_price,
                     reference_price=ref_price, fee=fee, realized_pnl=realized,
-                    reason=reason)
+                    reason=reason, trade_id=pos.trade_id)
 
     def close(self, symbol: str, price: float, ts: int | None = None,
               reason: str = "close") -> Fill | None:
@@ -226,12 +244,14 @@ class PaperBroker:
             "cash": self._cash,
             "total_fees": self.total_fees,
             "total_realized_pnl": self.total_realized_pnl,
+            "trade_seq": self._trade_seq,
             "positions": [
                 {
                     "symbol": pos.symbol, "qty": pos.qty, "avg_price": pos.avg_price,
                     "opened_ts": pos.opened_ts, "stop_price": pos.stop_price,
                     "extreme_price": pos.extreme_price, "realized_pnl": pos.realized_pnl,
                     "fees_paid": pos.fees_paid, "entry_reason": pos.entry_reason,
+                    "trade_id": pos.trade_id, "entry_fees": pos.entry_fees,
                 }
                 for pos in self._positions.values()
             ],
@@ -258,6 +278,10 @@ class PaperBroker:
                     realized_pnl=float(row.get("realized_pnl") or 0.0),
                     fees_paid=float(row.get("fees_paid") or 0.0),
                     entry_reason=row.get("entry_reason") or "",
+                    # Ledgers written before trade ids existed: derive a stable
+                    # id so the lifecycle can still be closed out under one key.
+                    trade_id=row.get("trade_id") or f"{row['symbol']}-{int(row['opened_ts'])}",
+                    entry_fees=float(row.get("entry_fees") or 0.0),
                 )
                 positions[pos.symbol] = pos
             cash = float(raw["cash"])
@@ -279,6 +303,7 @@ class PaperBroker:
         self._positions = positions
         self.total_fees = float(raw.get("total_fees") or 0.0)
         self.total_realized_pnl = float(raw.get("total_realized_pnl") or 0.0)
+        self._trade_seq = int(raw.get("trade_seq") or 0)
         logger.info("Restored broker state: $%.2f cash, %d open position(s)",
                     self._cash, len(self._positions))
         return True

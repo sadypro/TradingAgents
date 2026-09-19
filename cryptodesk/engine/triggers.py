@@ -15,8 +15,9 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass
 
-from ..config import LLMBudget
+from ..config import LLMBudget, RiskLimits
 from ..indicators import Snapshot
+from .risk import RiskState
 
 
 @dataclass
@@ -116,3 +117,33 @@ def evaluate(snapshot: Snapshot, ctx: TriggerContext, budget: LLMBudget,
 
     return Trigger(False, "no_trigger",
                    f"nothing material changed ({minutes_since:.0f}m since last run)")
+
+
+def entries_blocked(state: RiskState, equity: float, gross_exposure: float,
+                    limits: RiskLimits, symbol: str, now: float) -> str | None:
+    """Why a *new* entry in ``symbol`` would be refused, or None if it might pass.
+
+    Mirrors the account-level gates at the top of ``risk.plan_entry`` — the
+    ones that depend only on the risk state, never on what the committee says.
+    For a flat symbol they decide the run's outcome in advance: Sell, Hold and
+    Underweight are no-ops with no position, and Buy/Overweight would be
+    refused, so waking a paid committee cannot change the book. The messages
+    match ``plan_entry`` so a dashboard reader sees one vocabulary.
+    """
+    if state.halted:
+        return f"desk halted: {state.halt_reason}"
+    drawdown = state.drawdown(equity)
+    if drawdown >= limits.max_drawdown_halt:
+        return (f"drawdown {drawdown:.1%} at or past halt limit "
+                f"{limits.max_drawdown_halt:.1%}")
+    day_pnl = state.day_pnl_pct(equity)
+    if day_pnl <= -limits.daily_loss_limit:
+        return (f"daily loss {day_pnl:.2%} past limit "
+                f"-{limits.daily_loss_limit:.2%}; no new entries today")
+    if state.cooling_down(symbol, now):
+        remaining = int((state.cooldowns[symbol] - now) / 60)
+        return f"cooldown active for {symbol} ({remaining}m remaining)"
+    if gross_exposure >= limits.max_gross_exposure:
+        return (f"gross exposure {gross_exposure:.1%} at cap "
+                f"{limits.max_gross_exposure:.1%}")
+    return None

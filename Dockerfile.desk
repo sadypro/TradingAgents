@@ -38,10 +38,13 @@ ENV CRYPTODESK_API_HOST=0.0.0.0 \
 
 EXPOSE 8787
 
-# The desk's own liveness check: is the trading loop still ticking?
+# The desk's own liveness check: is the engine alive (ticking, or inside a
+# committee run under llm.max_run_seconds)? Reads the port from the same env
+# var the desk binds on, so overriding it in compose does not leave the
+# container permanently "unhealthy". Loopback is always an allowed Host.
 HEALTHCHECK --interval=60s --timeout=10s --start-period=30s --retries=3 \
-  CMD python -c "import urllib.request,sys; \
-sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8787/api/health', timeout=5).status == 200 else 1)"
+  CMD python -c "import os,urllib.request,sys; p=os.environ.get('CRYPTODESK_API_PORT','8787'); \
+sys.exit(0 if urllib.request.urlopen(f'http://127.0.0.1:{p}/api/health', timeout=5).status == 200 else 1)"
 
 ENTRYPOINT ["python", "-m", "cryptodesk"]
 CMD ["run"]

@@ -48,6 +48,14 @@ class RiskState:
     halt_reason: str = ""
     # symbol -> epoch seconds until which new entries are refused
     cooldowns: dict[str, int] = field(default_factory=dict)
+    # Lifetime worst drawdown. Kept here rather than recomputed from the
+    # equity curve so a dashboard window that starts after the trough still
+    # reports it.
+    max_drawdown: float = 0.0
+    # The benchmark's price at the desk's first mark, set once by the engine,
+    # so buy-and-hold is measured from inception rather than from wherever the
+    # chart window happens to start.
+    first_benchmark_price: float | None = None
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -73,6 +81,7 @@ class RiskState:
             self.day_start_equity = equity
         self.roll_day(equity, now)
         self.peak_equity = max(self.peak_equity, equity)
+        self.max_drawdown = max(self.max_drawdown, self.drawdown(equity))
 
     def drawdown(self, equity: float) -> float:
         """Fractional drawdown from the high-water mark (0.0 when at a new high)."""
@@ -141,11 +150,15 @@ def size_position(equity: float, price: float, atr: float, limits: RiskLimits,
 def plan_entry(symbol: str, snapshot: Snapshot, equity: float, cash: float,
                current_qty: float, gross_exposure: float, state: RiskState,
                limits: RiskLimits, conviction: float = 1.0,
-               now: float | None = None) -> EntryPlan:
+               now: float | None = None, cost_rate: float = 0.0) -> EntryPlan:
     """Decide whether, and how large, a long entry may be placed.
 
     Checks run cheapest-and-most-fatal first so the reason surfaced to the
     dashboard is the one that actually matters.
+
+    ``cost_rate`` is the broker's fee plus slippage as a fraction (the engine
+    passes ``(fee_bps + slippage_bps) / 10_000``), so a cash-bound entry is
+    sized to what will actually fill after costs.
     """
     now = now if now is not None else time.time()
 
@@ -189,9 +202,14 @@ def plan_entry(symbol: str, snapshot: Snapshot, equity: float, cash: float,
         qty = room / snapshot.price
         notional = qty * snapshot.price
 
-    # Never spend more cash than is held (paper or not, leverage is not modelled).
-    if notional > cash:
-        qty = max(0.0, cash / snapshot.price * 0.999)  # leave room for fees
+    # Never spend more cash than is held (paper or not, leverage is not
+    # modelled). The broker slips the price and then charges the fee on the
+    # slipped notional, so the cost compounds: (1 + slip)(1 + fee) exceeds
+    # 1 + cost_rate by a cross term that cost_rate**2 always covers. The
+    # 1e-6 absorbs floating-point rounding in the broker's own check.
+    cost_mult = 1 + cost_rate + cost_rate ** 2
+    if notional * cost_mult > cash:
+        qty = max(0.0, cash / (snapshot.price * cost_mult) * (1 - 1e-6))
         notional = qty * snapshot.price
 
     if notional < limits.min_order_notional:

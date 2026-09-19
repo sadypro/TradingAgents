@@ -23,6 +23,28 @@ services:
       # Cap what the committee may spend per UTC day. Raise it only after you
       # have measured your real per-run cost.
       CRYPTODESK_LLM_DAILY_CAP: "5.00"
+      # What one committee run is booked at when the provider's usage cannot
+      # be priced. The cap is only as honest as this figure.
+      # CRYPTODESK_LLM_COST_PER_RUN: "0.35"
+      # Provider list prices per million tokens (set both). With these the
+      # desk prices each run from the tokens it actually used and labels the
+      # cost "measured" instead of "estimate".
+      # CRYPTODESK_LLM_PRICE_IN: "3.00"
+      # CRYPTODESK_LLM_PRICE_OUT: "15.00"
+      # Longest a single committee run may take before the health check
+      # stops treating "busy" as alive.
+      # CRYPTODESK_LLM_MAX_RUN_SECONDS: "900"
+      # Sizing knobs that used to need a config file.
+      # CRYPTODESK_MAX_WEIGHT_DRIFT: "0.20"
+      # CRYPTODESK_MIN_ORDER_NOTIONAL: "25"
+      # CRYPTODESK_CANDLE_LOOKBACK: "200"      # at most 300 with the cryptocom feed
+      # Extra Host header values the API answers to, for a reverse proxy in
+      # front of it. Any other Host is refused with 400 (DNS-rebinding guard).
+      # CRYPTODESK_API_ALLOWED_HOSTS: "desk.example.com"
+      # Change the port here and in `ports:` below; the HEALTHCHECK follows it.
+      # CRYPTODESK_API_PORT: "8787"
+      # A full config file instead of env vars: put it on the data volume.
+      # CRYPTODESK_CONFIG: "/home/appuser/.cryptodesk/cryptodesk.json"
     ports:
       # Bound to localhost on purpose: the dashboard has no authentication,
       # and anyone who can reach it can halt the desk.

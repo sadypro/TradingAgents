@@ -94,7 +94,7 @@ Four independent limits, each able to stop trading on its own:
 | `max_weight_drift` | +20% | How far a winner may drift above that before being trimmed |
 | `max_gross_exposure` | 60% | Total deployed across all symbols |
 | `risk_per_trade` | 1% | Equity lost if the stop fills exactly |
-| `daily_loss_limit` | 3% | Halts *new entries* for the rest of the UTC day |
+| `daily_loss_limit` | 3% | Mark-to-market loss (realised plus unrealised) since 00:00 UTC that halts *new entries* for the rest of the day |
 | `max_drawdown_halt` | 15% | Flattens the book and halts until a human resumes |
 | `cooldown_minutes` | 120 | No re-entry on a symbol after it stops out |
 
@@ -102,17 +102,47 @@ Plus a hard stop and a trailing stop on every position, set at entry.
 
 The kill-switch does not clear itself. `python -m cryptodesk run` will start
 back up halted; resuming is a deliberate act (the Resume button, or
-`POST /api/resume`).
+`POST /api/resume`). Resuming re-bases the drawdown peak to current equity
+(otherwise the same drawdown would halt the desk again on the next tick) but
+**keeps the day's loss baseline**: a halt/resume cycle never hands back the
+budget the day already spent. Resume on a desk that is not halted is refused
+(`409`) rather than quietly re-basing the brakes.
+
+### Stale feeds
+
+A symbol whose venue stops answering, or whose last closed candle is more than
+two intervals old, is *stale*. A stale symbol gets no new entries, no stop
+exits (a stop cannot fill on a frozen quote), and the committee is not woken
+for it; its trailing stop still ratchets. A halt leaves a stale position open
+with its stop armed and retries the flatten every tick until a fresh quote
+arrives. When *every* symbol is stale no equity point is written, so an outage
+does not paint a flat line into the track record. The dashboard header says
+`feed stale: SOL-USD` and the positions table marks the row.
+
+Positions the ledger restored for symbols that are no longer in `symbols` are
+priced, stop-managed and **exit-only**: managed out, never re-entered, and
+listed on the dashboard as such.
+
+Fills and decisions are stamped at the time the committee *finished*, and the
+decision row keeps the price the committee analysed alongside the price the
+order actually filled at.
 
 ---
 
 ## The dashboard
 
 - **Stat tiles** — equity, return, return *net of LLM spend*, alpha vs
-  buy-and-hold, max drawdown, win rate, open risk, today's token bill.
+  buy-and-hold, max drawdown, win rate, open risk, today's token bill. These
+  are **lifetime** figures, computed over the whole ledger (thinned to ~4,000
+  marks) with the desk's exact lifetime max drawdown and the benchmark's price
+  at inception.
 - **Equity curve** — the desk against buy-and-hold of the benchmark, on one
-  dollar axis, with a dashed line at starting capital.
-- **Open positions** — entry, mark, stop, distance to stop, open P&L.
+  dollar axis, with a dashed line at starting capital. The chart shows only
+  the **last 1,500 marks** (about a day at the default cadence); the buy-and-hold
+  line is anchored at the first-ever benchmark price, so it still reads from
+  day one. The footer under the chart says which window is which.
+- **Open positions** — entry, mark, stop, distance to stop, open P&L, the
+  venue that served the quote, and a *stale* / *exit-only* flag where it applies.
 - **Risk limits** — a meter per brake, so you can see how close each is.
 - **Decisions** — every committee run: the trigger, the rating, what it argued,
   what the risk engine did with it, and the reason if it was refused. Expand
@@ -121,7 +151,35 @@ back up halted; resuming is a deliberate act (the Resume button, or
 
 Controls are limited to Halt and Resume on purpose. There is no manual-order
 button: a hand-placed trade would corrupt the track record the desk exists to
-produce.
+produce. Resume is only enabled while halted, and asks for confirmation
+because it re-bases the drawdown peak.
+
+### Scripting the API
+
+The two control endpoints (`POST /api/halt`, `POST /api/resume`) require the
+header `X-CryptoDesk-Control: 1` and refuse `Sec-Fetch-Site: cross-site`.
+A custom header forces a browser to preflight a cross-origin request, and the
+API answers no preflight, so a page you happen to visit cannot halt your desk
+(or resume it and re-base the brakes) through your own browser. Any script
+just adds the header:
+
+```bash
+curl -X POST -H 'X-CryptoDesk-Control: 1' 'http://127.0.0.1:8787/api/halt?reason=maintenance'
+```
+
+The API also only answers to a `Host` header of `127.0.0.1`, `localhost`,
+`::1`, `api_host`, or an entry in `api_allowed_hosts`; anything else is a
+`400`. That is the DNS-rebinding guard: without it a page on
+`attacker.example` that later resolves to `127.0.0.1` could read the state,
+the decisions (with the verbatim agent reports) and drive the controls as a
+same-origin request. Behind a reverse proxy, set
+`CRYPTODESK_API_ALLOWED_HOSTS=desk.example.com` (a port may be included; the
+host part is what is matched).
+
+`GET /api/health` is green while the engine thread is alive and has
+heartbeated within two loop periods, **or** while it is inside a committee
+run shorter than `llm.max_run_seconds` — a multi-minute model run is `busy`,
+not dead. The payload carries `busy`, `heartbeat_ts` and `stale_symbols`.
 
 ---
 
@@ -143,7 +201,14 @@ python -m cryptodesk run
 ```
 
 Every key in `config.py` has a comment explaining what it does and why the
-default is what it is.
+default is what it is. Loading validates: negative fees, a `nan` limit, a
+weight above 100%, a quoted number or boolean in the JSON, an unknown feed or
+interval, or a symbol that will not parse all fail at startup with the field
+named. Symbols are stored canonically (`btcusd` -> `BTC-USD`). An explicit
+config path (`--config` or `CRYPTODESK_CONFIG`) that does not exist is an
+error, not a silent fall-back to defaults; `doctor` prints which file it
+loaded. The benchmark need not be traded — when it is not in `symbols` its
+price is fetched separately, for the comparison only.
 
 ---
 
@@ -198,11 +263,21 @@ A full TradingAgents run is roughly a dozen LLM calls over large contexts. Run
 that every minute across five symbols and it is ~7,000 runs a day.
 
 The desk defaults to a **$5/day cap**, a 45-minute per-symbol cooldown, and a
-4-hour floor cadence. The reported cost is the configured *estimate*
-(`llm.estimated_cost_per_run_usd`), because the graph does not report provider
-usage back to callers — the dashboard labels it as an estimate. Measure one run
-against your provider's billing dashboard and set that number to the real one;
-the cap is only as honest as that figure.
+4-hour floor cadence.
+
+Tokens are counted per run. When `llm.price_per_million_input_usd` and
+`llm.price_per_million_output_usd` are set (`CRYPTODESK_LLM_PRICE_IN` /
+`CRYPTODESK_LLM_PRICE_OUT`), each run is priced from the tokens it actually
+used and the dashboard labels the cost **(measured)**. Otherwise the configured
+*estimate* (`llm.estimated_cost_per_run_usd`, `CRYPTODESK_LLM_COST_PER_RUN`)
+is booked and labelled **(estimate)**; the cap is only as honest as that
+figure, so measure one run against your provider's billing and set it. A run
+that dies before its first model call costs nothing; one that dies mid-way
+still pays for what it burned.
+
+`TRADINGAGENTS_LLM_PROVIDER` and the model env vars pick the provider, and the
+key checked at startup is the one *that* provider needs. The graph's results,
+data cache and decision memory live under `<home>/tradingagents/`.
 
 ---
 
@@ -229,4 +304,6 @@ flattens, the daily LLM cap holds, and the whole book survives a restart.
   beat it net of cost, it is not earning its keep.
 - **Synthetic results prove nothing about edge.** They exercise the machinery.
 - **The dashboard has no authentication.** Bind it to localhost or put a
-  reverse proxy with auth in front of it.
+  reverse proxy with auth in front of it. A localhost bind is not by itself
+  protection from your own browser; the control header and Host allow-list
+  above are what provide that.

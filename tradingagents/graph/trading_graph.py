@@ -265,7 +265,20 @@ class TradingAgentsGraph:
         actual_holding_days)`` or ``(None, None, None)`` if price data is
         unavailable (too recent, delisted, or network error).
         """
+        import pandas as pd
+
         from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+        def utc_dates(index):
+            """Collapse a price index to UTC calendar dates.
+
+            A non-datetime index (some callers stub ``history`` with a plain
+            RangeIndex) is returned untouched so positions still compare.
+            """
+            if not isinstance(index, pd.DatetimeIndex):
+                return index
+            index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+            return index.normalize()
 
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
@@ -286,24 +299,37 @@ class TradingAgentsGraph:
             # periods whenever the two series trade on different calendars —
             # crypto runs 7 days a week and equity benchmarks 5, so row N of a
             # BTC series and row N of SPY are days apart, and every crypto
-            # alpha figure was wrong by a weekend.
-            target = stock.index[min(holding_days, len(stock) - 1)]
-            # If the benchmark's history ends earlier, both sides truncate to
-            # the last date they share rather than one running past the other.
-            common_end = min(target, bench.index[-1])
-            stock_pos = max(1, int(stock.index.searchsorted(common_end, side="right")) - 1)
-            bench_pos = max(1, int(bench.index.searchsorted(common_end, side="right")) - 1)
+            # alpha figure was wrong by a weekend. Comparing raw timestamps is
+            # not enough either: yfinance stamps BTC-USD at 00:00 UTC and SPY
+            # at 00:00 New York, so the same trading day sorts differently on
+            # each side. Both indexes are reduced to UTC calendar dates first.
+            stock_days = utc_dates(stock.index)
+            bench_days = utc_dates(bench.index)
+
+            # The window opens on the first date BOTH series have (a crypto
+            # decision on a Saturday must not start its benchmark leg two
+            # days later) and closes ``holding_days`` bars on from there, or
+            # on the last date they share if either history ends earlier.
+            common_start = max(stock_days[0], bench_days[0])
+            stock_start = int(stock_days.searchsorted(common_start, side="left"))
+            bench_start = int(bench_days.searchsorted(common_start, side="left"))
+            target = stock_days[min(stock_start + holding_days, len(stock_days) - 1)]
+            common_end = min(target, bench_days[-1])
+            stock_pos = int(stock_days.searchsorted(common_end, side="right")) - 1
+            bench_pos = int(bench_days.searchsorted(common_end, side="right")) - 1
+            if stock_pos <= stock_start or bench_pos <= bench_start:
+                return None, None, None  # no shared window yet; retry next run
 
             raw = float(
-                (stock["Close"].iloc[stock_pos] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
+                (stock["Close"].iloc[stock_pos] - stock["Close"].iloc[stock_start])
+                / stock["Close"].iloc[stock_start]
             )
             bench_ret = float(
-                (bench["Close"].iloc[bench_pos] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
+                (bench["Close"].iloc[bench_pos] - bench["Close"].iloc[bench_start])
+                / bench["Close"].iloc[bench_start]
             )
             alpha = raw - bench_ret
-            return raw, alpha, stock_pos
+            return raw, alpha, stock_pos - stock_start
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",

@@ -15,15 +15,66 @@ def broker():
 
 
 def test_round_trip_at_a_flat_price_loses_exactly_fees_and_slippage(broker):
-    broker.market_order("BTC-USD", "buy", 0.1, 60_000, ts=1)
-    broker.market_order("BTC-USD", "sell", 0.1, 60_000, ts=2)
+    entry = broker.market_order("BTC-USD", "buy", 0.1, 60_000, ts=1)
+    exit_ = broker.market_order("BTC-USD", "sell", 0.1, 60_000, ts=2)
 
     buy_price, sell_price = 60_000 * 1.0005, 60_000 * 0.9995
     expected_fees = 0.1 * buy_price * 0.001 + 0.1 * sell_price * 0.001
-    expected = 10_000 - 0.1 * (buy_price - sell_price) - expected_fees
+    slippage_cost = 0.1 * (buy_price - sell_price)
+    expected = 10_000 - slippage_cost - expected_fees
 
     assert broker.equity({}) == pytest.approx(expected)
     assert broker.positions() == {}
+    # Realised P&L must carry the entry-side fee too, or every per-trade
+    # statistic is gross of half the costs while equity is net of all of them.
+    assert exit_.realized_pnl == pytest.approx(-(entry.fee + exit_.fee) - slippage_cost)
+    assert exit_.realized_pnl == pytest.approx(broker.equity({}) - 10_000)
+    assert broker.total_realized_pnl == pytest.approx(broker.equity({}) - 10_000)
+
+
+def test_a_marginal_winner_after_the_exit_fee_is_a_loser_after_both_fees():
+    """The case the entry-fee omission mis-scored as a win."""
+    broker = PaperBroker(10_000, fee_bps=10, slippage_bps=5)
+    broker.market_order("BTC-USD", "buy", 0.1, 60_000, ts=1)
+    fill = broker.market_order("BTC-USD", "sell", 0.1, 60_000 * 1.0025, ts=2)
+    assert fill.realized_pnl < 0
+    assert fill.realized_pnl == pytest.approx(broker.equity({}) - 10_000)
+
+
+def test_entry_fees_are_released_pro_rata_over_partial_exits():
+    broker = PaperBroker(100_000, fee_bps=10, slippage_bps=0)
+    broker.market_order("BTC-USD", "buy", 2.0, 100, ts=1)     # entry fee 0.20
+    pos = broker.position("BTC-USD")
+    assert pos.entry_fees == pytest.approx(0.20)
+    assert pos.avg_price == pytest.approx(100), "avg_price stays gross of fees"
+
+    first = broker.market_order("BTC-USD", "sell", 0.5, 100, ts=2)
+    # A quarter of the position closes: a quarter of the entry fee plus the
+    # exit fee on 50 notional.
+    assert first.realized_pnl == pytest.approx(-(0.05 + 0.05))
+    assert broker.position("BTC-USD").entry_fees == pytest.approx(0.15)
+
+    second = broker.market_order("BTC-USD", "sell", 1.5, 100, ts=3)
+    assert second.realized_pnl == pytest.approx(-(0.15 + 0.15))
+    assert broker.positions() == {}
+    assert broker.total_realized_pnl == pytest.approx(broker.equity({}) - 100_000)
+
+
+def test_adding_to_a_position_accumulates_entry_fees_under_one_trade_id():
+    broker = PaperBroker(100_000, fee_bps=10, slippage_bps=0)
+    first = broker.market_order("BTC-USD", "buy", 1.0, 100, ts=1)
+    second = broker.market_order("BTC-USD", "buy", 1.0, 100, ts=2)
+    pos = broker.position("BTC-USD")
+    assert pos.entry_fees == pytest.approx(0.20)
+    assert first.trade_id == second.trade_id == pos.trade_id
+    assert pos.trade_id == "BTC-USD-1-1"
+
+    closing = broker.market_order("BTC-USD", "sell", 2.0, 100, ts=3)
+    assert closing.trade_id == pos.trade_id
+    # A fresh lifecycle gets a fresh id, even at the same timestamp.
+    reopened = broker.market_order("BTC-USD", "buy", 1.0, 100, ts=3)
+    assert reopened.trade_id == "BTC-USD-3-2"
+    assert reopened.trade_id != closing.trade_id
 
 
 def test_costless_broker_captures_the_whole_move():
@@ -76,6 +127,26 @@ def test_overselling_a_position_is_refused_when_shorts_are_off(broker):
         broker.market_order("BTC-USD", "sell", 5.0, 60_000, ts=2)
 
 
+def test_overselling_is_refused_rather_than_truncated_even_with_shorts_on():
+    """A reversal must not be silently filled as a plain close."""
+    broker = PaperBroker(10_000, fee_bps=10, slippage_bps=5, allow_shorts=True)
+    broker.market_order("BTC-USD", "buy", 0.1, 60_000, ts=1)
+    with pytest.raises(OrderRejected, match="reversing direction"):
+        broker.market_order("BTC-USD", "sell", 0.3, 60_000, ts=2)
+    assert broker.position("BTC-USD").qty == pytest.approx(0.1)
+    assert broker.total_fees == pytest.approx(sum(f.fee for f in broker.fills))
+
+
+def test_total_fees_reconciles_with_the_fills_and_with_cash():
+    broker = PaperBroker(10_000, fee_bps=10, slippage_bps=5)
+    broker.market_order("BTC-USD", "buy", 0.1, 60_000, ts=1)
+    broker.market_order("BTC-USD", "sell", 0.04, 60_000, ts=2)
+    broker.close("BTC-USD", 60_000, ts=3)
+    assert broker.total_fees == pytest.approx(sum(f.fee for f in broker.fills))
+    slippage_cost = sum(abs(f.price - f.reference_price) * f.qty for f in broker.fills)
+    assert 10_000 - broker.cash() == pytest.approx(broker.total_fees + slippage_cost)
+
+
 def test_missing_price_marks_at_entry_rather_than_dropping_the_position():
     """A feed hiccup must not make equity jump — that would trip the kill-switch."""
     broker = PaperBroker(10_000, fee_bps=0, slippage_bps=0)
@@ -103,6 +174,29 @@ def test_state_round_trips_through_serialisation():
     assert set(restored.positions()) == set(broker.positions())
     assert restored.position("BTC-USD").stop_price == pytest.approx(58_000)
     assert restored.position("BTC-USD").qty == pytest.approx(broker.position("BTC-USD").qty)
+    assert restored.position("BTC-USD").trade_id == broker.position("BTC-USD").trade_id
+    assert restored.position("BTC-USD").entry_fees == pytest.approx(
+        broker.position("BTC-USD").entry_fees)
+
+    # The restored book books the same realised P&L and never reuses an id.
+    original_close = broker.close("ETH-USD", 3_000, ts=3)
+    restored_close = restored.close("ETH-USD", 3_000, ts=3)
+    assert restored_close.realized_pnl == pytest.approx(original_close.realized_pnl)
+    assert restored.market_order("SOL-USD", "buy", 1.0, 100, ts=3).trade_id == "SOL-USD-3-3"
+
+
+def test_state_written_before_trade_ids_still_loads():
+    """Old ledgers have no trade_id/entry_fees; they must restore, not be refused."""
+    broker = PaperBroker(10_000)
+    assert broker.load_state({
+        "cash": 4_000, "starting_equity": 10_000,
+        "positions": [{"symbol": "BTC-USD", "qty": 0.1, "avg_price": 60_000,
+                       "opened_ts": 1_700_000_000}],
+    }) is True
+    pos = broker.position("BTC-USD")
+    assert pos.trade_id == "BTC-USD-1700000000"
+    assert pos.entry_fees == 0.0
+    assert broker.close("BTC-USD", 60_000, ts=1_700_000_100).trade_id == pos.trade_id
 
 
 @pytest.mark.parametrize("bad", [None, {}, {"cash": 5_000, "positions": [{"symbol": "X"}]}])

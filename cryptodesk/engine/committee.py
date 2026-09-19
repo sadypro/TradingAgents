@@ -18,9 +18,12 @@ quantity. Sizing belongs to ``engine.risk`` alone.
 from __future__ import annotations
 
 import logging
+import re
+import threading
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from typing import Any
 
 from ..config import DeskConfig
 from ..indicators import Snapshot
@@ -92,7 +95,10 @@ class HeuristicCommittee:
     # Vol ratio past which no new risk is taken.
     vol_panic_ratio = 2.5
 
-    def decide(self, symbol: str, snapshot: Snapshot, trigger_reason: str = "") -> Proposal:
+    def decide(self, symbol: str, snapshot: Snapshot, trigger_reason: str = "",
+               now: float | None = None) -> Proposal:
+        # ``now`` is part of the shared committee signature; the rule reads
+        # only the snapshot, so the clock is irrelevant here.
         started = time.perf_counter()
         trend = snapshot.trend
         rsi = snapshot.rsi14
@@ -126,17 +132,95 @@ class HeuristicCommittee:
         )
 
 
+class UsageTracker:
+    """Token and call counts for one graph run, fed by the LLM callbacks.
+
+    Kept free of langchain imports so the counters (and their pricing) can be
+    exercised without the graph's dependencies; ``_usage_callback_handler``
+    wraps it in a real ``BaseCallbackHandler`` when the graph is built.
+    """
+
+    def __init__(self) -> None:
+        # Callbacks can arrive from worker threads when the graph fans out.
+        self._lock = threading.Lock()
+        self.reset()
+
+    def reset(self) -> None:
+        with self._lock:
+            self.llm_calls = 0
+            self.tokens_in = 0
+            self.tokens_out = 0
+
+    def record_start(self) -> None:
+        with self._lock:
+            self.llm_calls += 1
+
+    def record_end(self, response: Any) -> None:
+        """Read ``usage_metadata`` off the first generation, as cli/stats_handler does."""
+        try:
+            generation = response.generations[0][0]
+        except (IndexError, TypeError, AttributeError):
+            return
+        usage = getattr(getattr(generation, "message", None), "usage_metadata", None)
+        if usage:
+            with self._lock:
+                self.tokens_in += int(usage.get("input_tokens", 0) or 0)
+                self.tokens_out += int(usage.get("output_tokens", 0) or 0)
+
+    def to_dict(self) -> dict:
+        return {"llm_calls": self.llm_calls, "tokens_in": self.tokens_in,
+                "tokens_out": self.tokens_out}
+
+
+def _usage_callback_handler(tracker: UsageTracker):
+    """Build the langchain callback that feeds ``tracker``; imported lazily."""
+    from langchain_core.callbacks import BaseCallbackHandler
+
+    class _UsageHandler(BaseCallbackHandler):
+        def on_llm_start(self, serialized, prompts, **kwargs):
+            tracker.record_start()
+
+        def on_chat_model_start(self, serialized, messages, **kwargs):
+            tracker.record_start()
+
+        def on_llm_end(self, response, **kwargs):
+            tracker.record_end(response)
+
+    return _UsageHandler()
+
+
+def desk_ta_config(cfg: DeskConfig, overrides: dict | None = None) -> dict:
+    """TradingAgents config rooted under the desk home.
+
+    DEFAULT_CONFIG points results, cache and the memory log at
+    ``~/.tradingagents``, which the desk's Docker volume does not cover; the
+    reflection loop would then be reset on every image rebuild. Keying them
+    under ``cfg.home_path`` keeps everything the desk learns in one place.
+    """
+    from tradingagents.default_config import DEFAULT_CONFIG
+
+    root = cfg.home_path / "tradingagents"
+    return {
+        **DEFAULT_CONFIG,
+        "results_dir": str(root / "logs"),
+        "data_cache_dir": str(root / "cache"),
+        "memory_log_path": str(root / "memory" / "trading_memory.md"),
+        **(overrides or {}),
+    }
+
+
 class LLMCommittee:
     """Runs the TradingAgents graph for one symbol and extracts a rating.
 
     The graph is imported lazily so the desk starts (and the heuristic runs)
     even when TradingAgents' heavier dependencies are absent.
 
-    On cost: the graph does not report provider token usage back to callers, so
-    ``cost_usd`` here is the configured per-run estimate and is flagged as such
-    via ``cost_is_estimate``. Measure one run against your provider's dashboard
-    and set ``llm.estimated_cost_per_run_usd`` to the real number — the daily
-    cap is only as honest as that figure.
+    On cost: a callback handler on the graph's LLMs counts provider-reported
+    tokens per run. When the desk config carries per-million-token prices
+    (``llm.price_per_million_input_usd`` / ``..._output_usd``) the run is priced
+    from those counts; otherwise ``cost_usd`` is the configured per-run estimate
+    and is flagged via ``cost_is_estimate``. A run that died before its first
+    LLM call is charged nothing.
     """
 
     source = "llm"
@@ -146,56 +230,99 @@ class LLMCommittee:
         self.cfg = cfg
         self._ta_config = ta_config
         self._graph = None
+        self._usage = UsageTracker()
+
+    @property
+    def ta_config(self) -> dict:
+        """The TradingAgents config this committee runs with (resolved lazily)."""
+        if self._ta_config is None:
+            self._ta_config = desk_ta_config(self.cfg)
+        return self._ta_config
 
     def _build_graph(self):
         """Construct the TradingAgentsGraph on first use."""
         if self._graph is not None:
             return self._graph
-        from tradingagents.default_config import DEFAULT_CONFIG
         from tradingagents.graph.trading_graph import TradingAgentsGraph
 
-        ta_config = dict(self._ta_config or DEFAULT_CONFIG)
         # Crypto has no fundamentals to analyse; the analyst would burn tokens
         # producing a report about a company that does not exist.
         analysts = ["market", "social", "news"]
         self._graph = TradingAgentsGraph(
-            selected_analysts=analysts, debug=False, config=ta_config
+            selected_analysts=analysts, debug=False, config=dict(self.ta_config),
+            callbacks=[_usage_callback_handler(self._usage)],
         )
         return self._graph
 
-    def decide(self, symbol: str, snapshot: Snapshot, trigger_reason: str = "") -> Proposal:
+    def decide(self, symbol: str, snapshot: Snapshot, trigger_reason: str = "",
+               now: float | None = None) -> Proposal:
         from tradingagents.agents.utils.rating import parse_rating
 
         started = time.perf_counter()
-        trade_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        trade_date = _trade_date(now, snapshot)
+        # Counters are cumulative across the graph's life; zero them so the
+        # cost below is this run's alone.
+        self._usage.reset()
         try:
             graph = self._build_graph()
             final_state, decision = graph.propagate(symbol, trade_date, asset_type="crypto")
         except Exception as exc:  # noqa: BLE001 - any failure must not stop the desk
             logger.exception("LLM committee failed for %s", symbol)
+            cost, is_estimate = self._price_run(ok=False)
             return Proposal(
                 symbol=symbol, rating="Hold", conviction=0.0,
                 summary=f"committee failed, holding: {exc}", source=self.source,
                 latency_ms=int((time.perf_counter() - started) * 1000),
-                error=str(exc),
-                # A failed run may still have burned tokens before dying.
-                cost_usd=self.cfg.llm.estimated_cost_per_run_usd,
-                cost_is_estimate=True,
+                error=str(exc), cost_usd=cost, cost_is_estimate=is_estimate,
+                detail={**self._usage.to_dict(), "trigger": trigger_reason,
+                        "trade_date": trade_date},
             )
 
-        rating = parse_rating(str(decision))
+        # propagate() already returns the parsed rating word; the PM's rendered
+        # markdown is where the reasoning lives, so the summary comes from there.
+        pm_text = str((final_state or {}).get("final_trade_decision") or decision)
+        rating = decision if decision in RATINGS else parse_rating(pm_text)
         detail = _extract_reports(final_state)
         detail["trigger"] = trigger_reason
+        detail["trade_date"] = trade_date
         detail["indicators"] = snapshot.to_dict()
+        detail.update(self._usage.to_dict())
+        cost, is_estimate = self._price_run(ok=True)
         return Proposal(
             symbol=symbol, rating=rating, conviction=RATING_CONVICTION.get(rating, 0.0),
-            summary=_first_meaningful_line(str(decision)) or f"Rating: {rating}",
-            source=self.source,
-            cost_usd=self.cfg.llm.estimated_cost_per_run_usd,
-            cost_is_estimate=True,
+            summary=_first_meaningful_line(pm_text) or f"Rating: {rating}",
+            source=self.source, cost_usd=cost, cost_is_estimate=is_estimate,
             latency_ms=int((time.perf_counter() - started) * 1000),
             detail=detail,
         )
+
+    def _price_run(self, ok: bool) -> tuple[float, bool]:
+        """Return ``(cost_usd, cost_is_estimate)`` for the run just finished."""
+        usage = self._usage
+        price_in = getattr(self.cfg.llm, "price_per_million_input_usd", None)
+        price_out = getattr(self.cfg.llm, "price_per_million_output_usd", None)
+        if price_in is not None and price_out is not None \
+                and (usage.tokens_in or usage.tokens_out):
+            cost = usage.tokens_in / 1e6 * price_in + usage.tokens_out / 1e6 * price_out
+            return round(cost, 6), False
+        # Nothing reached a provider, so nothing was billed. Only on failure:
+        # a successful run with no callback traffic means usage went
+        # unreported, and over-booking the estimate is the safer error.
+        if not ok and usage.llm_calls == 0:
+            return 0.0, False
+        return self.cfg.llm.estimated_cost_per_run_usd, True
+
+
+def _trade_date(now: float | None, snapshot: Snapshot) -> str:
+    """The date the graph analyses: the desk clock, else the bar, else today.
+
+    ``simulate --replay`` drives the desk with a clock set in the past; using
+    the wall clock there would have the committee reason about today's market
+    while the fills come from the replayed one.
+    """
+    ts = now if now is not None else (snapshot.ts or None)
+    when = datetime.fromtimestamp(ts, tz=timezone.utc) if ts else datetime.now(timezone.utc)
+    return when.strftime("%Y-%m-%d")
 
 
 # Sections pulled out of the graph's final state for the dashboard, so a human
@@ -234,22 +361,78 @@ def _extract_reports(final_state: dict) -> dict:
     return detail
 
 
+_EMPHASIS_RE = re.compile(r"\*\*|__")
+
+
 def _first_meaningful_line(text: str, limit: int = 240) -> str:
     """First non-heading, non-empty line — a usable one-line summary."""
     for line in text.splitlines():
-        stripped = line.strip().lstrip("#*->").strip()
+        # Drop markdown emphasis so "**Executive Summary**: ..." reads cleanly.
+        stripped = _EMPHASIS_RE.sub("", line).strip().lstrip("#*->").strip()
         if len(stripped) > 30 and not stripped.lower().startswith("rating"):
             return stripped[:limit]
     return ""
 
 
+class FallbackCommittee:
+    """Runs ``primary`` until it fails repeatedly, then ``fallback`` for good.
+
+    A single failed run is noise (rate limit, transient network); a streak
+    means the LLM path is broken — expired key, deleted model — and every
+    further attempt would only burn the daily cap on Hold. Switching is
+    permanent for the process: whoever fixed the key restarts the desk, and
+    the name says which committee actually produced the track record.
+    """
+
+    def __init__(self, primary, fallback, max_consecutive_failures: int = 3):
+        self.primary = primary
+        self.fallback = fallback
+        self.max_consecutive_failures = max_consecutive_failures
+        self.active = primary
+        self.consecutive_failures = 0
+        self.switched_reason: str | None = None
+
+    @property
+    def name(self) -> str:
+        if self.switched_reason is None:
+            return self.active.name
+        return (f"{self.fallback.name} (fallback after "
+                f"{self.max_consecutive_failures} {self.primary.name} failures)")
+
+    @property
+    def source(self) -> str:
+        return self.active.source
+
+    def decide(self, symbol: str, snapshot: Snapshot, trigger_reason: str = "",
+               now: float | None = None) -> Proposal:
+        proposal = self.active.decide(symbol, snapshot, trigger_reason, now=now)
+        if self.active is not self.primary:
+            return proposal
+        if proposal.error is None:
+            self.consecutive_failures = 0
+            return proposal
+        self.consecutive_failures += 1
+        if self.consecutive_failures >= self.max_consecutive_failures:
+            self.switch(f"{self.consecutive_failures} consecutive {self.primary.name} "
+                        f"failures; last: {proposal.error}")
+        return proposal
+
+    def switch(self, reason: str) -> None:
+        """Route every further decision to the fallback and remember why."""
+        self.active = self.fallback
+        self.switched_reason = reason
+        logger.error("Committee switched to %s: %s", self.fallback.name, reason)
+
+
 def build_committee(cfg: DeskConfig, ta_config: dict | None = None):
     """Pick a committee per config, falling back to the heuristic when needed.
 
-    ``committee="auto"`` uses the LLM only when TradingAgents imports *and* a
-    provider key is present. Falling back rather than crashing is deliberate: a
-    desk that stops trading because a key expired is worse than one that keeps
-    running a documented baseline and says so on the dashboard.
+    ``committee="auto"`` uses the LLM only when TradingAgents imports, the key
+    its configured provider needs is present, *and* the graph constructs; at
+    runtime it is wrapped so a streak of failed runs drops to the heuristic
+    too. Falling back rather than crashing is deliberate: a desk that stops
+    trading because a key expired is worse than one that keeps running a
+    documented baseline and says so on the dashboard.
     """
     mode = (cfg.committee or "auto").lower()
     if mode == "heuristic":
@@ -260,28 +443,56 @@ def build_committee(cfg: DeskConfig, ta_config: dict | None = None):
         raise ValueError(f"Unknown committee mode {cfg.committee!r}; "
                          "expected 'auto', 'llm' or 'heuristic'")
 
-    reason = _llm_unavailable_reason()
+    reason = _llm_unavailable_reason(ta_config)
     if reason:
         logger.warning("Committee falling back to heuristic: %s", reason)
         return HeuristicCommittee()
-    return LLMCommittee(cfg, ta_config)
+    llm = LLMCommittee(cfg, ta_config)
+    try:
+        # Construct now rather than on the first trigger: a provider that
+        # rejects its key at client construction should fall back at startup,
+        # not after burning the failure streak.
+        llm._build_graph()
+    except Exception as exc:  # noqa: BLE001 - construction errors are provider-specific
+        logger.warning("Committee falling back to heuristic: graph construction failed: %s", exc)
+        return HeuristicCommittee()
+    return FallbackCommittee(llm, HeuristicCommittee())
 
 
-# Provider keys recognised by TradingAgents; any one is enough to try the LLM.
-_PROVIDER_KEYS = (
-    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY", "XAI_API_KEY",
-    "DEEPSEEK_API_KEY", "DASHSCOPE_API_KEY", "ZHIPU_API_KEY", "MINIMAX_API_KEY",
-    "OPENROUTER_API_KEY", "OPENAI_COMPATIBLE_API_KEY", "AWS_ACCESS_KEY_ID",
-)
+def _llm_unavailable_reason(ta_config: dict | None = None) -> str | None:
+    """Return why the LLM committee cannot run, or None when it can.
 
-
-def _llm_unavailable_reason() -> str | None:
-    """Return why the LLM committee cannot run, or None when it can."""
+    The key checked is the one the *configured* provider needs — a desk with
+    only ``ANTHROPIC_API_KEY`` set and the default (openai) provider would
+    otherwise pass here and fail on every run.
+    """
     import importlib.util
     import os
 
     if importlib.util.find_spec("langgraph") is None:
         return "TradingAgents dependencies are not installed (langgraph missing)"
-    if not any(os.environ.get(key) for key in _PROVIDER_KEYS):
-        return "no LLM provider API key found in the environment"
+
+    from tradingagents.llm_clients.api_key_env import get_api_key_env
+
+    if ta_config is None:
+        from tradingagents.default_config import DEFAULT_CONFIG
+        ta_config = DEFAULT_CONFIG
+    provider = str(ta_config.get("llm_provider") or "openai")
+    key_env = get_api_key_env(provider)
+    if key_env is None or _key_is_optional(provider):
+        # Bedrock uses the AWS credential chain; local runtimes do not
+        # authenticate; unknown providers cannot be checked here.
+        return None
+    if not os.environ.get(key_env):
+        return f"{key_env} is not set (llm_provider={provider!r})"
     return None
+
+
+def _key_is_optional(provider: str) -> bool:
+    """Whether the provider registry marks ``provider`` as runnable keyless."""
+    try:
+        from tradingagents.llm_clients.openai_client import OPENAI_COMPATIBLE_PROVIDERS
+    except ImportError:
+        return False
+    spec = OPENAI_COMPATIBLE_PROVIDERS.get(provider.lower())
+    return bool(spec is not None and spec.key_optional)

@@ -80,6 +80,8 @@
   .pill.live { color: var(--good-text); }
   .pill.halted { color: var(--critical); }
   .pill.stale { color: var(--serious); }
+  .pill.busy { color: var(--series-1); }
+  .pill.warn { color: var(--serious); font-weight: 500; }
 
   .card {
     background: var(--surface-1); border: 1px solid var(--border);
@@ -161,6 +163,12 @@
   }
   .tag.buy { color: var(--good-text); } .tag.sell { color: var(--critical); }
   .tag.hold { color: var(--text-secondary); }
+  .tag.stale { color: var(--serious); }
+  .tag.exit { color: var(--text-muted); }
+  td.stale, td.stale * { color: var(--text-muted); }
+  .chart-foot { color: var(--text-muted); font-size: 12px; margin: 10px 0 0; line-height: 1.5; }
+  .feedline { color: var(--text-secondary); font-size: 12.5px; margin: 10px 0 0; line-height: 1.6; }
+  .feedline b { font-weight: 600; }
   .decision .why { color: var(--text-secondary); flex: 1 1 220px; min-width: 0; overflow: hidden; text-overflow: ellipsis; }
   .decision .body { padding: 0 12px 12px; border-top: 1px solid var(--grid); }
   .decision .body h4 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-muted); margin: 14px 0 5px; }
@@ -183,6 +191,8 @@
   .ev .k { color: var(--text-muted); flex: 0 0 auto; }
   .ev.error .k, .ev.error span { color: var(--critical); }
   .ev.warning .k { color: var(--serious); }
+  .ev[data-kind="stale"] .k, .ev[data-kind="halt"] .k, .ev[data-kind="committee"] .k { color: var(--serious); font-weight: 600; }
+  button.action:disabled { opacity: 0.45; cursor: not-allowed; }
 
   footer.controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 4px; }
   button.action {
@@ -218,11 +228,13 @@
       <div class="tip" id="tip"></div>
     </div>
     <div id="chart-data" hidden class="scroll" style="margin-top:12px"></div>
+    <p class="chart-foot" id="chart-foot"></p>
   </section>
 
   <section class="card">
     <h2>Open positions</h2>
     <div class="scroll" id="positions"></div>
+    <p class="feedline" id="feeds"></p>
   </section>
 
   <section class="card">
@@ -285,12 +297,16 @@ async function get(path) {
 
 /* ---------------- header + tiles ---------------- */
 function renderHeader(s) {
-  const since = s.last_tick_ts ? (s.now - s.last_tick_ts) : null;
-  // Two missed intervals is a stall, matching /api/health.
-  const stale = since == null || since > 150;
+  // Liveness follows the heartbeat, not tick completion, matching /api/health:
+  // a committee run lasts minutes and is "busy", not a stall.
+  const since = s.heartbeat_ts ? (s.now - s.heartbeat_ts) : null;
+  const stalled = !s.busy && (since == null || since > 150);
   let pill = '<span class="pill live"><span class="dot"></span>Running</span>';
   if (s.risk.halted) pill = '<span class="pill halted"><span class="dot"></span>Halted</span>';
-  else if (stale) pill = '<span class="pill stale"><span class="dot"></span>Stalled</span>';
+  else if (stalled) pill = '<span class="pill stale"><span class="dot"></span>Stalled</span>';
+  if (s.busy) pill += ` <span class="pill busy"><span class="dot"></span>busy: ${esc(s.busy)}</span>`;
+  const staleSyms = s.stale_symbols || [];
+  if (staleSyms.length) pill += ` <span class="pill warn">feed stale: ${esc(staleSyms.join(", "))}</span>`;
 
   const feedErr = Object.keys(s.feed_errors || {}).length;
   document.getElementById("meta").innerHTML = pill +
@@ -300,9 +316,13 @@ function renderHeader(s) {
     `<span>last <b>${s.last_tick_ts ? tsTime(s.last_tick_ts) : "never"}</b></span>`;
   document.getElementById("mode-sub").textContent =
     `paper · ${s.symbols.join(", ")}`;
+  const unflat = (s.risk.unflattened || []);
   document.getElementById("control-note").textContent = s.risk.halted
-    ? "Halted: " + s.risk.halt_reason
-    : "Halting flattens every position immediately.";
+    ? "Halted: " + s.risk.halt_reason +
+      (unflat.length ? ` — still holding ${unflat.join(", ")} (no fresh quote; retried every tick)` : "")
+    : "Halting flattens every position immediately. Resume is only available while halted.";
+  // Resume on a running desk is refused by the API (409); do not offer it.
+  document.getElementById("btn-resume").disabled = !s.risk.halted;
 }
 
 function tile(label, value, foot, cls, hero) {
@@ -325,7 +345,7 @@ function renderKpis(s) {
          perf.benchmark_return == null ? "no benchmark marks yet"
            : `benchmark ${fmtSigned(perf.benchmark_return)}`, clsOf(alpha)),
     tile("Max drawdown", fmtPct(perf.max_drawdown || 0),
-         `halts at ${fmtPct(s.risk.limits.max_drawdown_halt, 0)}`,
+         `lifetime · halts at ${fmtPct(s.risk.limits.max_drawdown_halt, 0)}`,
          (perf.max_drawdown || 0) > s.risk.limits.max_drawdown_halt * 0.66 ? "down" : "flat"),
     tile("Win rate", st.closed_trades ? fmtPct(st.win_rate, 1) : "—",
          `${st.closed_trades} closed · PF ${st.profit_factor == null ? "—" : st.profit_factor.toFixed(2)}`,
@@ -344,8 +364,10 @@ const W = 900, H = 300, PAD = {t: 14, r: 64, b: 26, l: 58};
 
 function seriesFrom(rows, start) {
   // Benchmark is scaled to the same starting capital, so both series share one
-  // dollar axis. A second y-scale would make the comparison meaningless.
-  const base = rows.find(r => r.benchmark_price)?.benchmark_price;
+  // dollar axis. A second y-scale would make the comparison meaningless. It is
+  // anchored at the first-ever benchmark price, not the window's first row, so
+  // a chart of the last day still shows buy-and-hold from inception.
+  const base = perf.benchmark_base_price || rows.find(r => r.benchmark_price)?.benchmark_price;
   const strat = rows.map(r => ({ts: r.ts, v: r.equity}));
   const bench = base ? rows.filter(r => r.benchmark_price)
     .map(r => ({ts: r.ts, v: start * (r.benchmark_price / base)})) : [];
@@ -360,6 +382,7 @@ function renderChart() {
       font-size="13">Collecting data — the curve appears after a few ticks.</text>`;
     document.getElementById("legend").innerHTML = "";
     note.textContent = "";
+    document.getElementById("chart-foot").textContent = "";
     return;
   }
   const {strat, bench} = seriesFrom(curve, startEquity);
@@ -419,7 +442,12 @@ function renderChart() {
     `<span class="key"><i class="swatch" style="background:var(--series-1)"></i>Desk equity</span>` +
     (bench.length ? `<span class="key"><i class="swatch" style="background:var(--series-2)"></i>Buy &amp; hold benchmark</span>` : "") +
     `<span class="key" style="color:var(--text-muted)">— — starting capital</span>`;
-  note.textContent = `— ${curve.length} marks, ${tsFull(t0)} to ${tsFull(t1)}`;
+  note.textContent = `— last ${curve.length} marks, ${tsFull(t0)} to ${tsFull(t1)}`;
+  document.getElementById("chart-foot").textContent = perf.start_ts
+    ? `The tiles (return, alpha, max drawdown, win rate) are lifetime statistics since ` +
+      `${tsFull(perf.start_ts)} over ${perf.points} sampled marks; the chart shows only the last ` +
+      `${curve.length} marks, and buy & hold is anchored at the first-ever benchmark price.`
+    : "";
 
   attachHover(svg, {strat, bench, X, Y, t0, t1});
   renderChartTable();
@@ -478,21 +506,49 @@ function renderChartTable() {
 /* ---------------- panels ---------------- */
 function renderPositions(s) {
   const host = document.getElementById("positions");
+  const venues = s.feed_venue || {};
+  const exitOnly = new Set(s.held_not_configured || []);
   if (!s.positions.length) {
     host.innerHTML = '<p class="empty">Flat — no open positions.</p>';
-    return;
+  } else {
+    const rows = s.positions.map(p => {
+      const stopDist = (p.stop_price && p.price) ? (p.price - p.stop_price) / p.price : null;
+      // A stale row's mark and P&L are the last known quote, not the market:
+      // flagged and muted rather than shown as if they were live.
+      const flags = (p.stale ? ' <span class="tag stale">stale</span>' : "") +
+        (exitOnly.has(p.symbol) ? ' <span class="tag exit">exit-only</span>' : "");
+      const mute = p.stale ? "stale" : "";
+      return `<tr><td>${esc(p.symbol)}${flags}</td><td>${fmtQty(p.qty)}</td>
+        <td>${fmtUSD(p.avg_price, 4)}</td><td class="${mute}">${fmtUSD(p.price, 4)}</td>
+        <td>${p.stop_price ? fmtUSD(p.stop_price, 4) : "—"}</td>
+        <td class="${mute || (stopDist == null ? "" : "flat")}">${stopDist == null ? "—" : fmtPct(stopDist, 1)}</td>
+        <td class="${mute || clsOf(p.unrealized_pnl)}">${fmtUSD(p.unrealized_pnl)}</td>
+        <td class="${mute || clsOf(p.unrealized_pct)}">${fmtSigned(p.unrealized_pct)}</td>
+        <td>${esc(venues[p.symbol] || "—")}</td></tr>`;
+    }).join("");
+    host.innerHTML = `<table><thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Price</th>
+      <th>Stop</th><th>To stop</th><th>Open P&amp;L</th><th>%</th><th>Venue</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
-  const rows = s.positions.map(p => {
-    const stopDist = (p.stop_price && p.price) ? (p.price - p.stop_price) / p.price : null;
-    return `<tr><td>${esc(p.symbol)}</td><td>${fmtQty(p.qty)}</td>
-      <td>${fmtUSD(p.avg_price, 4)}</td><td>${fmtUSD(p.price, 4)}</td>
-      <td>${p.stop_price ? fmtUSD(p.stop_price, 4) : "—"}</td>
-      <td class="${stopDist == null ? "" : "flat"}">${stopDist == null ? "—" : fmtPct(stopDist, 1)}</td>
-      <td class="${clsOf(p.unrealized_pnl)}">${fmtUSD(p.unrealized_pnl)}</td>
-      <td class="${clsOf(p.unrealized_pct)}">${fmtSigned(p.unrealized_pct)}</td></tr>`;
-  }).join("");
-  host.innerHTML = `<table><thead><tr><th>Symbol</th><th>Qty</th><th>Entry</th><th>Price</th>
-    <th>Stop</th><th>To stop</th><th>Open P&amp;L</th><th>%</th></tr></thead><tbody>${rows}</tbody></table>`;
+  renderFeeds(s);
+}
+
+function renderFeeds(s) {
+  // Which venue served each symbol, who is stale, and how each venue in the
+  // chain is doing — so a primary that is always failing behind its fallback
+  // is visible rather than silently absorbed.
+  const venues = s.feed_venue || {}, stale = new Set(s.stale_symbols || []);
+  const bySymbol = (s.symbols || []).concat(s.held_not_configured || []).map(sym =>
+    `<b>${esc(sym)}</b> via ${esc(venues[sym] || "—")}${stale.has(sym) ? ' <span class="down">(stale)</span>' : ""}`);
+  const health = Object.entries(s.feed_health || {}).map(([name, h]) => {
+    const bad = h.failures > 0;
+    return `<b>${esc(name)}</b>: ${bad ? `<span class="down">${h.failures} consecutive failure${h.failures === 1 ? "" : "s"}</span>` : "ok"}` +
+      (h.last_ok_ts ? `, last ok ${tsTime(h.last_ok_ts)}` : "") +
+      (bad && h.last_error ? ` — ${esc(String(h.last_error).slice(0, 80))}` : "");
+  });
+  const bench = s.benchmark_price != null ? ` · benchmark ${fmtUSD(s.benchmark_price)}` : "";
+  document.getElementById("feeds").innerHTML =
+    (bySymbol.length ? "Feed: " + bySymbol.join(" · ") : "") + bench +
+    (health.length ? `<br>Venues: ${health.join(" · ")}` : "");
 }
 
 function meter(label, value, limit, fmt) {
@@ -519,6 +575,10 @@ function renderRisk(s) {
 }
 
 const RATING_CLASS = {Buy: "buy", Overweight: "buy", Sell: "sell", Underweight: "sell", Hold: "hold"};
+// A run priced from the tokens it used is "measured"; one booked at the
+// configured per-run figure is an "estimate". Both are said out loud.
+const costLabel = (detail, cost) => detail.cost_is_estimate === true ? " (estimate)"
+  : (detail.cost_is_estimate === false && cost ? " (measured)" : "");
 
 function renderDecisions(list) {
   const host = document.getElementById("decisions");
@@ -538,7 +598,7 @@ function renderDecisions(list) {
 rating: ${esc(d.rating)} (conviction ${d.conviction == null ? "—" : d.conviction.toFixed(2)})
 action: ${esc(d.action)}${d.allowed ? "" : "  [risk engine refused]"}
 ${d.veto_reason ? "reason: " + esc(d.veto_reason) + "\n" : ""}price: ${fmtUSD(d.price, 4)}${d.qty ? "  qty: " + fmtQty(d.qty) : ""}${d.notional ? "  notional: " + fmtUSD(d.notional) : ""}
-${d.stop_price ? "stop: " + fmtUSD(d.stop_price, 4) + "\n" : ""}source: ${esc(d.source)}  latency: ${(d.latency_ms / 1000).toFixed(1)}s  cost: ${fmtUSD(d.cost_usd)}${detail.cost_is_estimate && d.cost_usd ? " (estimate)" : ""}</pre>`;
+${d.stop_price ? "stop: " + fmtUSD(d.stop_price, 4) + "\n" : ""}source: ${esc(d.source)}  latency: ${(d.latency_ms / 1000).toFixed(1)}s  cost: ${fmtUSD(d.cost_usd)}${costLabel(detail, d.cost_usd)}</pre>`;
     const actionNote = d.allowed
       ? (d.action === "none" ? "no change" : d.action)
       : "blocked: " + (d.veto_reason || "risk limit");
@@ -569,7 +629,7 @@ function renderEvents(list) {
   const host = document.getElementById("events");
   if (!list.length) { host.innerHTML = '<p class="empty">Nothing logged yet.</p>'; return; }
   host.innerHTML = list.slice(0, 40).map(e =>
-    `<div class="ev ${esc(e.level)}"><time>${tsTime(e.ts)}</time>
+    `<div class="ev ${esc(e.level)}" data-kind="${esc(e.kind)}"><time>${tsTime(e.ts)}</time>
       <span class="k">${esc(e.kind)}</span><span>${esc(e.message)}</span></div>`).join("");
 }
 
@@ -598,12 +658,28 @@ async function refresh() {
   }
 }
 
-document.getElementById("btn-halt").onclick = async () => {
+// The control header is what stops a foreign page from POSTing these: a custom
+// header forces a CORS preflight, which the API does not answer.
+async function control(path) {
+  const r = await fetch(path, {method: "POST", headers: {"X-CryptoDesk-Control": "1"}});
+  let why = null;
+  if (!r.ok) {
+    why = r.status + "";
+    try { why = (await r.json()).detail || why; } catch (e) { /* not JSON */ }
+  }
+  await refresh();
+  // After the refresh, so the header's own note does not paint over it.
+  if (why) document.getElementById("control-note").textContent = `${path} refused: ${why}`;
+}
+document.getElementById("btn-halt").onclick = () => {
   if (!confirm("Halt the desk and flatten every open position?")) return;
-  await fetch("/api/halt", {method: "POST"}); refresh();
+  control("/api/halt");
 };
-document.getElementById("btn-resume").onclick = async () => {
-  await fetch("/api/resume", {method: "POST"}); refresh();
+document.getElementById("btn-resume").onclick = () => {
+  if (!confirm("Resume the desk?\n\nThe drawdown peak will be re-based to current equity " +
+               "(otherwise the same drawdown halts it again next tick). " +
+               "Today's loss limit keeps its baseline.")) return;
+  control("/api/resume");
 };
 document.getElementById("btn-theme").onclick = () => {
   const dark = document.documentElement.getAttribute("data-theme") === "dark" ||

@@ -7,6 +7,7 @@ does not have limits.
 
 import pytest
 
+from cryptodesk.broker import PaperBroker
 from cryptodesk.config import RiskLimits
 from cryptodesk.engine.risk import (
     RiskState,
@@ -150,6 +151,29 @@ def test_entry_is_capped_by_remaining_room_under_the_gross_limit(limits):
     assert plan.notional <= 10_000 * 0.05 + 1e-6
 
 
+@pytest.mark.parametrize("fee_bps, slippage_bps", [(10, 5), (0, 0), (100, 100)])
+def test_a_cash_bound_entry_actually_fills_at_the_broker(fee_bps, slippage_bps):
+    """The clamp must leave room for the costs the broker will really charge.
+
+    A flat 0.1% buffer was smaller than the default 0.15% of fee plus slippage,
+    so every cash-bound entry was planned and then refused by the broker.
+    """
+    limits = RiskLimits(max_gross_exposure=2.0, max_symbol_weight=1.0, risk_per_trade=0.5)
+    broker = PaperBroker(1_000, fee_bps=fee_bps, slippage_bps=slippage_bps)
+    cost_rate = (fee_bps + slippage_bps) / 10_000
+    plan = plan_entry("BTC-USD", snapshot(), equity=1_000, cash=broker.cash(),
+                      current_qty=0.0, gross_exposure=0.0, state=fresh_state(1_000),
+                      limits=limits, conviction=1.0, now=0, cost_rate=cost_rate)
+    assert plan.allowed
+    assert plan.notional <= 1_000
+
+    fill = broker.market_order("BTC-USD", "buy", plan.qty, 60_000, ts=1)
+    assert fill.qty == pytest.approx(plan.qty)
+    # Nearly all the cash is deployed: the buffer covers the compounding of
+    # slippage and fee (at most cost_rate**2) plus a rounding margin, no more.
+    assert broker.cash() <= 1_000 * (cost_rate ** 2 + 2e-6)
+
+
 # ---------------------------------------------------------------- stops
 def test_trailing_stop_only_ever_ratchets_up(limits):
     stop, extreme = None, 60_000.0
@@ -193,3 +217,24 @@ def test_peak_equity_is_a_high_water_mark():
         state.observe(equity, now=0)
     assert state.peak_equity == 12_000
     assert state.drawdown(9_000) == pytest.approx(0.25)
+
+
+def test_max_drawdown_is_lifetime_and_survives_recovery():
+    """The trough must still be reported after equity makes a new high."""
+    state = RiskState()
+    for equity in (10_000, 12_000, 9_000, 13_000, 12_500):
+        state.observe(equity, now=0)
+    assert state.max_drawdown == pytest.approx(0.25)
+    assert state.drawdown(12_500) < state.max_drawdown
+
+    restored = RiskState.from_dict(state.to_dict())
+    assert restored.max_drawdown == pytest.approx(0.25)
+
+
+def test_first_benchmark_price_round_trips_and_defaults_to_none():
+    assert RiskState().first_benchmark_price is None
+    state = fresh_state()
+    state.first_benchmark_price = 60_000.0
+    assert RiskState.from_dict(state.to_dict()).first_benchmark_price == 60_000.0
+    # A state persisted before the field existed still loads.
+    assert RiskState.from_dict({"peak_equity": 1.0}).first_benchmark_price is None

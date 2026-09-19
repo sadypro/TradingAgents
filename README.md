@@ -233,6 +233,32 @@ print(decision)
 
 See `tradingagents/default_config.py` for all configuration options.
 
+## CryptoDesk: 24/7 crypto paper trading
+
+`cryptodesk/` is a paper-trading desk built on this framework: an always-on
+loop that manages positions every minute, the TradingAgents committee woken
+only on a trigger under a daily spend cap, a deterministic risk engine that
+sizes every trade, and a dashboard showing what it did and why. No exchange
+account and no real orders.
+
+```bash
+pip install ".[desk]"
+python -m cryptodesk doctor                        # check feeds and credentials
+python -m cryptodesk simulate --days 30 --serve    # fast-forward a month, then look at it
+python -m cryptodesk run                           # live paper desk at 127.0.0.1:8787
+```
+
+It runs without an LLM key, using a free heuristic committee as the control
+group — if the agents cannot beat that net of token cost, they are not earning
+their keep. The brakes are code: a per-trade risk budget, a cap per symbol
+and across the book, a mark-to-market daily loss limit (realised plus
+unrealised, since 00:00 UTC) that halts new entries, and a drawdown
+kill-switch that flattens and halts until a human resumes — resuming re-bases
+the peak but keeps the day's loss baseline. The dashboard's statistics are
+lifetime figures while its chart shows the recent window, and the API refuses
+cross-site control requests and unknown Host headers. See
+[cryptodesk/README.md](cryptodesk/README.md).
+
 ## Persistence and Recovery
 
 TradingAgents persists two kinds of state across runs.

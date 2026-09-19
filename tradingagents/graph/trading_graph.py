@@ -238,9 +238,15 @@ class TradingAgentsGraph:
         entry, which is the right default because the alpha calculation works
         in USD.
         """
+        from tradingagents.dataflows.symbol_utils import crypto_base
+
         explicit = self.config.get("benchmark_ticker")
         if explicit:
             return explicit
+        # Crypto first: the suffix map below is equity-venue only, so a pair
+        # like BTC-USD would otherwise fall through to SPY (#alpha-vs-sp500).
+        if crypto_base(ticker) is not None:
+            return self.config.get("crypto_benchmark") or "BTC-USD"
         benchmark_map = self.config.get("benchmark_map", {})
         ticker_upper = ticker.upper()
         for suffix, benchmark in benchmark_map.items():
@@ -259,7 +265,20 @@ class TradingAgentsGraph:
         actual_holding_days)`` or ``(None, None, None)`` if price data is
         unavailable (too recent, delisted, or network error).
         """
+        import pandas as pd
+
         from tradingagents.dataflows.symbol_utils import normalize_symbol
+
+        def utc_dates(index):
+            """Collapse a price index to UTC calendar dates.
+
+            A non-datetime index (some callers stub ``history`` with a plain
+            RangeIndex) is returned untouched so positions still compare.
+            """
+            if not isinstance(index, pd.DatetimeIndex):
+                return index
+            index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+            return index.normalize()
 
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
@@ -275,17 +294,42 @@ class TradingAgentsGraph:
             if len(stock) < 2 or len(bench) < 2:
                 return None, None, None
 
-            actual_days = min(holding_days, len(stock) - 1, len(bench) - 1)
+            # Both legs of the alpha subtraction must span the same calendar
+            # window. Aligning by ROW instead silently compared different
+            # periods whenever the two series trade on different calendars —
+            # crypto runs 7 days a week and equity benchmarks 5, so row N of a
+            # BTC series and row N of SPY are days apart, and every crypto
+            # alpha figure was wrong by a weekend. Comparing raw timestamps is
+            # not enough either: yfinance stamps BTC-USD at 00:00 UTC and SPY
+            # at 00:00 New York, so the same trading day sorts differently on
+            # each side. Both indexes are reduced to UTC calendar dates first.
+            stock_days = utc_dates(stock.index)
+            bench_days = utc_dates(bench.index)
+
+            # The window opens on the first date BOTH series have (a crypto
+            # decision on a Saturday must not start its benchmark leg two
+            # days later) and closes ``holding_days`` bars on from there, or
+            # on the last date they share if either history ends earlier.
+            common_start = max(stock_days[0], bench_days[0])
+            stock_start = int(stock_days.searchsorted(common_start, side="left"))
+            bench_start = int(bench_days.searchsorted(common_start, side="left"))
+            target = stock_days[min(stock_start + holding_days, len(stock_days) - 1)]
+            common_end = min(target, bench_days[-1])
+            stock_pos = int(stock_days.searchsorted(common_end, side="right")) - 1
+            bench_pos = int(bench_days.searchsorted(common_end, side="right")) - 1
+            if stock_pos <= stock_start or bench_pos <= bench_start:
+                return None, None, None  # no shared window yet; retry next run
+
             raw = float(
-                (stock["Close"].iloc[actual_days] - stock["Close"].iloc[0])
-                / stock["Close"].iloc[0]
+                (stock["Close"].iloc[stock_pos] - stock["Close"].iloc[stock_start])
+                / stock["Close"].iloc[stock_start]
             )
             bench_ret = float(
-                (bench["Close"].iloc[actual_days] - bench["Close"].iloc[0])
-                / bench["Close"].iloc[0]
+                (bench["Close"].iloc[bench_pos] - bench["Close"].iloc[bench_start])
+                / bench["Close"].iloc[bench_start]
             )
             alpha = raw - bench_ret
-            return raw, alpha, actual_days
+            return raw, alpha, stock_pos - stock_start
         except Exception as e:
             logger.warning(
                 "Could not resolve outcome for %s on %s vs %s (will retry next run): %s",

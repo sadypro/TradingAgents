@@ -149,6 +149,14 @@ DEFAULT_CONFIG = _apply_env_overrides({
     # so the reflection label keeps reading "Alpha vs SPY" for US tickers
     # while non-US tickers get their regional index automatically.
     "benchmark_ticker": None,
+    # Benchmark for crypto tickers. The exchange-suffix map below only covers
+    # equity venues, so a pair like ``BTC-USD`` used to fall through to the
+    # empty-suffix default and have its alpha measured against SPY — a nearly
+    # meaningless comparison for a 24/7 crypto asset. BTC is the usual market
+    # proxy for the asset class; for BTC itself the comparison is against
+    # holding it, so the alpha term is zero by construction and the raw return
+    # carries the signal.
+    "crypto_benchmark": "BTC-USD",
     "benchmark_map": {
         ".NS":  "^NSEI",       # NSE India (Nifty 50)
         ".BO":  "^BSESN",      # BSE India (Sensex)
